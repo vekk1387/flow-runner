@@ -1,11 +1,11 @@
 """CLI entry point for the flow runner.
 
 Usage:
-    uv run flow-run demo-prompt.yaml --agent default
-    uv run flow-run demo-prompt.yaml --agent default --dry-run
-    uv run flow-run demo-prompt.yaml --agent default --provider gemini
+    uv run flow-prompt "Explain how LLM routing works"
+    uv run flow-prompt "Write a Python sort function" --provider claude --model sonnet
+    uv run flow-run demo-prompt.yaml --dry-run
+    uv run flow-run agent-receive-work-auto.yaml --agent sap
     uv run flow-run --list
-    uv run flow-run --inspect demo-prompt.yaml
 """
 
 from __future__ import annotations
@@ -31,8 +31,9 @@ def main():
     parser.add_argument("--provider", "-P", help="Override provider (gemini, codex, claude)")
     parser.add_argument("--trigger", "-t", default="manual", help="Trigger type (default: manual)")
     parser.add_argument("--dry-run", action="store_true", help="Run without LLM calls")
-    parser.add_argument("--model", "-m", help="Override model selection (e.g. opus, sonnet, haiku, gpt-5.4-mini)")
-    parser.add_argument("--cwd", help="Override working directory for LLM call (skip CLAUDE.md loading)")
+    parser.add_argument("--model", "-m", help="Override model selection (e.g. opus, sonnet, haiku, gemini-flash)")
+    parser.add_argument("--prompt", "-p", help="Prompt text (used with demo-prompt flow)")
+    parser.add_argument("--cwd", help="Override working directory for LLM call")
     parser.add_argument("--list", action="store_true", help="List available flows")
     parser.add_argument("--inspect", action="store_true", help="Show flow details without executing")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
@@ -79,6 +80,8 @@ def main():
         extra_context["cwd_override"] = args.cwd
     if args.provider:
         extra_context["provider_override"] = args.provider
+    if args.prompt:
+        extra_context["prompt_text"] = args.prompt
 
     try:
         result = runner.run(

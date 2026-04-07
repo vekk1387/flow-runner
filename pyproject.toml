@@ -10,6 +10,7 @@ dependencies = [
 
 [project.scripts]
 flow-run = "flow_runner.cli:main"
+flow-prompt = "flow_runner.prompt_cli:main"
 
 [build-system]
 requires = ["hatchling"]
