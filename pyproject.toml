@@ -1,0 +1,16 @@
+[project]
+name = "flow-runner"
+version = "0.1.0"
+description = "YAML-configured flow engine for multi-agent orchestration with full LLM auditability"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+flow-run = "flow_runner.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
