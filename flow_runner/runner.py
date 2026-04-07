@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 from datetime import datetime
@@ -23,7 +24,7 @@ from .steps import RunContext, get_action
 
 log = logging.getLogger(__name__)
 
-FLOWS_DIR = Path(__file__).resolve().parent.parent / ".flows"
+FLOWS_DIR = Path(os.environ.get("FLOWS_DIR", str(Path(__file__).resolve().parent.parent / ".flows")))
 
 
 class FlowRunner:
@@ -132,6 +133,14 @@ class FlowRunner:
                     # Track provider at the run level
                     if output.get("provider"):
                         run.context["_provider"] = output["provider"]
+
+                    # Store full prompt + response for eval/training
+                    prompt_text = context.get("prompt_payload", {}).get("user_prompt", "") if isinstance(context.get("prompt_payload"), dict) else ""
+                    response_text = output.get("text", "")
+                    provider = output.get("provider", "unknown")
+                    model_used = output.get("model", "unknown")
+                    if prompt_text or response_text:
+                        self._store_content(run.db_id, prompt_text, response_text, provider, model_used)
 
                     # Check for budget block or error
                     if output.get("stop_reason") == "budget_blocked":
@@ -325,6 +334,21 @@ class FlowRunner:
             f"output_summary = '{_esc(step.output_summary)}'"
             f"{error_clause}{tokens_clause}{cost_clause}{llm_clause};"
         )
+
+    def _store_content(self, flow_run_id: str, prompt: str, response: str,
+                        provider: str, model: str) -> None:
+        """Store full prompt + response text in flow_run_content for eval/training."""
+        try:
+            self.db.query(
+                f"CREATE flow_run_content SET "
+                f"flow_run = {flow_run_id}, "
+                f"prompt_text = '{_esc(prompt, max_len=50000)}', "
+                f"response_text = '{_esc(response, max_len=50000)}', "
+                f"provider = '{provider}', "
+                f"model = '{_esc(model)}';"
+            )
+        except Exception as e:
+            log.warning(f"Failed to store flow_run_content: {e}")
 
     def _finalize_flow_run(self, run: FlowRun) -> None:
         """Update flow_run record with final state."""

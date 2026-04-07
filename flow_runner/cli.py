@@ -1,10 +1,11 @@
 """CLI entry point for the flow runner.
 
 Usage:
-    uv run flow-run agent-receive-work.yaml --agent sap
-    uv run flow-run agent-receive-work.yaml --agent sap --dry-run
+    uv run flow-run demo-prompt.yaml --agent default
+    uv run flow-run demo-prompt.yaml --agent default --dry-run
+    uv run flow-run demo-prompt.yaml --agent default --provider gemini
     uv run flow-run --list
-    uv run flow-run --inspect agent-receive-work.yaml
+    uv run flow-run --inspect demo-prompt.yaml
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -22,10 +24,11 @@ from .runner import FlowRunner, FLOWS_DIR
 def main():
     parser = argparse.ArgumentParser(
         prog="flow-run",
-        description="Execute YAML-configured agent flows",
+        description="Execute YAML-configured flows with multi-provider LLM routing",
     )
     parser.add_argument("flow", nargs="?", help="Flow YAML filename (from .flows/)")
-    parser.add_argument("--agent", "-a", help="Agent ID (e.g. sap, coord, ui)")
+    parser.add_argument("--agent", "-a", help="Agent ID (default: 'default')")
+    parser.add_argument("--provider", "-P", help="Override provider (gemini, codex, claude)")
     parser.add_argument("--trigger", "-t", default="manual", help="Trigger type (default: manual)")
     parser.add_argument("--dry-run", action="store_true", help="Run without LLM calls")
     parser.add_argument("--model", "-m", help="Override model selection (e.g. opus, sonnet, haiku, gpt-5.4-mini)")
@@ -33,7 +36,7 @@ def main():
     parser.add_argument("--list", action="store_true", help="List available flows")
     parser.add_argument("--inspect", action="store_true", help="Show flow details without executing")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
-    parser.add_argument("--db-host", default="http://localhost:8282", help="SurrealDB host")
+    parser.add_argument("--db-host", default=os.environ.get("SURREAL_HOST", "http://localhost:8282"), help="SurrealDB host")
 
     args = parser.parse_args()
 
@@ -62,9 +65,9 @@ def main():
         _inspect_flow(flow_path)
         return
 
-    # Run mode
+    # Run mode — default agent to "default" if not provided
     if not args.agent:
-        parser.error("--agent required for flow execution")
+        args.agent = "default"
 
     db = SurrealClient(host=args.db_host)
     runner = FlowRunner(db=db, dry_run=args.dry_run)
@@ -74,6 +77,8 @@ def main():
         extra_context["model_override"] = args.model
     if args.cwd:
         extra_context["cwd_override"] = args.cwd
+    if args.provider:
+        extra_context["provider_override"] = args.provider
 
     try:
         result = runner.run(

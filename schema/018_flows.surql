@@ -11,7 +11,7 @@ DEFINE FIELD name ON flow TYPE string;
 DEFINE FIELD version ON flow TYPE int DEFAULT 1;
 DEFINE FIELD description ON flow TYPE option<string>;
 DEFINE FIELD trigger ON flow TYPE string
-  ASSERT $value IN ['dispatch_go', 'cron', 'message_received', 'manual', 'event'];
+  ASSERT $value IN ['dispatch_go', 'cron', 'message_received', 'manual', 'event', 'api'];
 DEFINE FIELD step_count ON flow TYPE int;
 DEFINE FIELD yaml_hash ON flow TYPE string;
 DEFINE FIELD synced_at ON flow TYPE datetime DEFAULT time::now();
@@ -100,3 +100,40 @@ DEFINE FIELD active ON model_config TYPE bool DEFAULT true;
 
 DEFINE INDEX idx_mc_key ON model_config FIELDS key UNIQUE;
 DEFINE INDEX idx_mc_tier ON model_config FIELDS tier;
+
+-- ============================================================
+-- flow_run_content: full prompt + response text for eval/training
+-- Stored separately to keep flow_step_log lean for dashboarding.
+-- Only written for LLM call steps; read by eval-routing flow.
+-- ============================================================
+DEFINE TABLE flow_run_content SCHEMAFULL;
+
+DEFINE FIELD flow_run ON flow_run_content TYPE record<flow_run>;
+DEFINE FIELD prompt_text ON flow_run_content TYPE string;
+DEFINE FIELD response_text ON flow_run_content TYPE string;
+DEFINE FIELD provider ON flow_run_content TYPE string;
+DEFINE FIELD model ON flow_run_content TYPE string;
+DEFINE FIELD created_at ON flow_run_content TYPE datetime DEFAULT time::now();
+
+DEFINE INDEX idx_frc_run ON flow_run_content FIELDS flow_run UNIQUE;
+DEFINE INDEX idx_frc_provider ON flow_run_content FIELDS provider;
+
+-- ============================================================
+-- routing_eval: LLM-as-judge evaluation results
+-- Written by eval-routing flow, used for training data.
+-- ============================================================
+DEFINE TABLE routing_eval SCHEMAFULL;
+
+DEFINE FIELD flow_run ON routing_eval TYPE record<flow_run>;
+DEFINE FIELD judge_model ON routing_eval TYPE string;
+DEFINE FIELD quality ON routing_eval TYPE option<int>;
+DEFINE FIELD could_simpler_handle ON routing_eval TYPE option<bool>;
+DEFINE FIELD was_misrouted ON routing_eval TYPE option<bool>;
+DEFINE FIELD reasoning ON routing_eval TYPE option<string>;
+DEFINE FIELD judge_tokens ON routing_eval TYPE option<int>;
+DEFINE FIELD judge_cost ON routing_eval TYPE option<float>;
+DEFINE FIELD parse_error ON routing_eval TYPE bool DEFAULT false;
+DEFINE FIELD created_at ON routing_eval TYPE datetime DEFAULT time::now();
+
+DEFINE INDEX idx_reval_run ON routing_eval FIELDS flow_run;
+DEFINE INDEX idx_reval_judge ON routing_eval FIELDS judge_model;

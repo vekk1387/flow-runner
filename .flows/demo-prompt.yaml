@@ -1,0 +1,50 @@
+flow: demo-prompt
+version: 1
+description: >
+  Simple demo flow: sends a prompt to the auto-router and logs the result.
+  Works standalone — no stored queries or agent infrastructure needed.
+trigger: manual
+
+steps:
+  - id: check_budget
+    action: budget.check
+    params: {}
+    output: budget
+
+  - id: assess
+    action: routing.assess
+    params:
+      tasks:
+        - title: "{{prompt_text}}"
+          description: ""
+          priority: 3
+      messages: []
+      persona: {}
+    output: assessment
+
+  - id: select_provider
+    action: routing.select_provider
+    params:
+      assessment: "{{assessment}}"
+      budget: "{{budget}}"
+      model_override: "{{model_override}}"
+      provider_override: "{{provider_override}}"
+    output: routing
+
+  - id: call_model
+    action: llm.call_auto
+    params:
+      routing: "{{routing}}"
+      prompt: "{{prompt_text}}"
+      agent_id: "{{agent_id}}"
+      budget: "{{budget}}"
+    output: llm_result
+    audit: full
+
+  - id: scorecard
+    action: routing.scorecard
+    params:
+      llm_result: "{{llm_result}}"
+      routing: "{{routing}}"
+      assessment: "{{assessment}}"
+    output: scorecard

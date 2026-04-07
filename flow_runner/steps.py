@@ -19,8 +19,15 @@ from .db import SurrealClient
 
 log = logging.getLogger(__name__)
 
-# Root of the agent-build repo
-REPO_ROOT = Path(__file__).resolve().parent.parent
+# Project root — configurable via environment
+PROJECT_ROOT = Path(os.environ.get("FLOW_RUNNER_ROOT", str(Path(__file__).resolve().parent.parent)))
+
+
+def _esc(s: str | None, max_len: int = 500) -> str:
+    """Escape a string for SurrealQL."""
+    if not s:
+        return ""
+    return s.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")[:max_len]
 
 
 @dataclass
@@ -63,10 +70,6 @@ def action_db_query(params: dict, ctx: RunContext) -> Any:
 
     results = ctx.db.execute_stored_query(query_key, bind)
 
-    # For agent_inbox, reshape into {messages: [...], tasks: [...]}
-    if query_key == "agent_inbox" and len(results) == 2:
-        return {"messages": results[0] or [], "tasks": results[1] or []}
-
     # For single-statement queries, unwrap
     if len(results) == 1:
         r = results[0]
@@ -79,21 +82,22 @@ def action_db_query(params: dict, ctx: RunContext) -> Any:
 
 @register_action("budget.check")
 def action_budget_check(params: dict, ctx: RunContext) -> dict:
-    """Check budget via the existing check-budget.sh script."""
-    script = REPO_ROOT / ".agents" / "check-budget.sh"
+    """Check budget via an external script (if configured)."""
+    script_path = os.environ.get("BUDGET_CHECK_SCRIPT", "")
+    script = Path(script_path) if script_path else None
 
     if ctx.dry_run:
         return {"status": "ok", "session_pct": 0, "weekly_pct": 0, "adaptive_cap": 100}
 
-    if not script.exists():
-        log.warning("check-budget.sh not found, returning ok")
+    if script is None or not script.exists():
+        log.warning("No budget check script configured or script not found, returning ok")
         return {"status": "ok", "session_pct": 0, "weekly_pct": 0, "adaptive_cap": 100}
 
     try:
         result = subprocess.run(
             ["bash", str(script)],
             capture_output=True, text=True, timeout=15,
-            cwd=str(REPO_ROOT),
+            cwd=str(PROJECT_ROOT),
         )
 
         output = result.stdout.strip()
@@ -143,12 +147,35 @@ def action_routing_assess(params: dict, ctx: RunContext) -> dict:
         for t in (tasks if isinstance(tasks, list) else [])
     )
 
+    # Detect task characteristics for provider routing
+    needs_tool_use = False
+    needs_repo_context = False
+    is_code_heavy = False
+
+    for t in (tasks if isinstance(tasks, list) else []):
+        title = (t.get("title", "") + " " + t.get("description", "")).lower()
+        # Tasks that mention file ops, git, or specific paths need tool use
+        if any(kw in title for kw in ("edit", "fix", "create file", "refactor",
+                                       "commit", "push", "git", "deploy", "test")):
+            needs_tool_use = True
+        # Tasks referencing infrastructure need repo context
+        if any(kw in title for kw in ("config", "schema", "database",
+                                       "infrastructure", "deploy")):
+            needs_repo_context = True
+        # Code-heavy tasks
+        if any(kw in title for kw in ("implement", "code", "function", "class",
+                                       "module", "script", "api", "endpoint")):
+            is_code_heavy = True
+
     # Estimate complexity
     if total_items == 0:
         return {
             "complexity": "none",
             "model_tier": "fast",
             "estimated_tokens": 0,
+            "needs_tool_use": False,
+            "needs_repo_context": False,
+            "is_code_heavy": False,
             "reason": "No work items found",
         }
 
@@ -170,7 +197,148 @@ def action_routing_assess(params: dict, ctx: RunContext) -> dict:
         "complexity": complexity,
         "model_tier": model_tier,
         "estimated_tokens": est_tokens,
+        "needs_tool_use": needs_tool_use,
+        "needs_repo_context": needs_repo_context,
+        "is_code_heavy": is_code_heavy,
         "reason": f"{task_count} tasks, {msg_count} messages, P1={has_p1}",
+    }
+
+
+# ── Provider Selection (zero-cost decision point) ─────────────────
+
+# Decision hierarchy:
+#   1. Gemini Flash — free API credits, use for everything it can handle
+#   2. Claude       — primary workhorse (haiku/sonnet/opus by complexity)
+#   3. Codex        — relief valve when Claude budget is tight
+#
+# Codex is NOT a capability tier. It's a budget pressure switch:
+# when Claude session/weekly spend is high, offload qualifying work to Codex.
+
+COMPLEXITY_RANK = {"none": 0, "low": 1, "medium": 2, "high": 3}
+
+# Budget thresholds that trigger Codex offload (percentage of cap)
+CODEX_SESSION_THRESHOLD = 60   # session spend > 60% → consider Codex
+CODEX_WEEKLY_THRESHOLD = 70    # weekly spend > 70% → consider Codex
+
+
+@register_action("routing.select_provider")
+def action_select_provider(params: dict, ctx: RunContext) -> dict:
+    """Zero-cost provider selection. Pure rules, no LLM call.
+
+    Logic:
+      1. Can Gemini handle it? (no tool use, no repo context, complexity <= medium) → Gemini
+      2. Is Claude budget under pressure? → offload to Codex if task doesn't need repo context
+      3. Otherwise → Claude (haiku/sonnet/opus scaled by complexity)
+    """
+    assessment = params.get("assessment", {})
+    budget = params.get("budget", {})
+    model_override = params.get("model_override")
+    provider_override = params.get("provider_override")
+
+    # ── Explicit overrides always win ──
+    if provider_override:
+        action_map = {"gemini": "llm.call_gemini", "codex": "llm.call_codex", "claude": "llm.call"}
+        model_map = {"gemini": "gemini-flash", "codex": "", "claude": "sonnet"}
+        return {
+            "provider": provider_override,
+            "action": action_map.get(provider_override, "llm.call"),
+            "model": model_map.get(provider_override, "sonnet"),
+            "reason": f"Explicit provider override: {provider_override}",
+            "cost_rank": 0 if provider_override == "gemini" else 1,
+        }
+
+    if model_override:
+        if model_override.startswith("gemini"):
+            return {
+                "provider": "gemini",
+                "action": "llm.call_gemini",
+                "model": model_override,
+                "reason": f"Model override: {model_override}",
+                "cost_rank": 0,
+            }
+        elif model_override in ("gpt-4o", "gpt-4o-mini", "o3", "o4-mini", "codex"):
+            return {
+                "provider": "codex",
+                "action": "llm.call_codex",
+                "model": model_override if model_override != "codex" else "",
+                "reason": f"Model override: {model_override}",
+                "cost_rank": 1,
+            }
+        else:
+            return {
+                "provider": "claude",
+                "action": "llm.call",
+                "model": model_override,
+                "reason": f"Model override: {model_override}",
+                "cost_rank": 2,
+            }
+
+    # ── Extract signals ──
+    complexity = assessment.get("complexity", "low")
+    needs_tool_use = assessment.get("needs_tool_use", False)
+    needs_repo_context = assessment.get("needs_repo_context", False)
+    is_code_heavy = assessment.get("is_code_heavy", False)
+
+    session_pct = budget.get("session_pct", 0)
+    weekly_pct = budget.get("weekly_pct", 0)
+    budget_pressure = (session_pct >= CODEX_SESSION_THRESHOLD
+                       or weekly_pct >= CODEX_WEEKLY_THRESHOLD)
+
+    reason_parts = [f"complexity={complexity}"]
+    if needs_tool_use:
+        reason_parts.append("tools")
+    if needs_repo_context:
+        reason_parts.append("repo_ctx")
+    if is_code_heavy:
+        reason_parts.append("code")
+    if budget_pressure:
+        reason_parts.append(f"budget_pressure(s={session_pct}%,w={weekly_pct}%)")
+
+    # ── Decision tree ──
+
+    # 1. Gemini: free, handles anything that doesn't need tool use or repo context
+    gemini_ok = (not needs_tool_use
+                 and not needs_repo_context
+                 and COMPLEXITY_RANK.get(complexity, 1) <= COMPLEXITY_RANK["medium"]
+                 and gemini_is_available())
+
+    if gemini_ok:
+        return {
+            "provider": "gemini",
+            "action": "llm.call_gemini",
+            "model": "gemini-flash",
+            "reason": f"Gemini (free): {', '.join(reason_parts)}",
+            "cost_rank": 0,
+        }
+
+    # 2. Budget pressure + doesn't need repo context → Codex relief valve
+    codex_ok = (budget_pressure
+                and not needs_repo_context
+                and COMPLEXITY_RANK.get(complexity, 1) <= COMPLEXITY_RANK["high"])
+
+    if codex_ok:
+        return {
+            "provider": "codex",
+            "action": "llm.call_codex",
+            "model": "",
+            "reason": f"Codex (budget relief): {', '.join(reason_parts)}",
+            "cost_rank": 1,
+        }
+
+    # 3. Claude — pick tier by complexity
+    if complexity == "high":
+        model = "opus"
+    elif complexity == "medium":
+        model = "sonnet"
+    else:
+        model = "haiku"
+
+    return {
+        "provider": "claude",
+        "action": "llm.call",
+        "model": model,
+        "reason": f"Claude {model}: {', '.join(reason_parts)}",
+        "cost_rank": 2,
     }
 
 
@@ -249,11 +417,7 @@ def action_prompt_build(params: dict, ctx: RunContext) -> dict:
 {task_text}
 {msg_text}
 
-Work through your assigned tasks and messages. For each task:
-1. Read the requirements carefully
-2. Execute the work within your boundaries
-3. Mark tasks complete when done (use complete-task.sh)
-4. Send messages to other agents if you need handoffs
+Work through the items below. Execute each task within your boundaries.
 
 Start now."""
 
@@ -262,6 +426,66 @@ Start now."""
         "model": model_flag,
         "model_tier": model_tier,
     }
+
+
+@register_action("llm.call_auto")
+def action_llm_call_auto(params: dict, ctx: RunContext) -> dict:
+    """Auto-dispatch to the right provider based on routing.select_provider output.
+
+    This is the single entry point — flows no longer pick a provider at the YAML level.
+    If the selected provider hits a rate limit (Gemini 429/403), automatically falls
+    back to the next cheapest provider.
+    """
+    routing = params.get("routing", {})
+    provider = routing.get("provider", "claude")
+    action_name = routing.get("action", "llm.call")
+    model = routing.get("model", "sonnet")
+
+    log.info(f"  llm.call_auto: provider={provider}, model={model}, "
+             f"reason={routing.get('reason', '?')}")
+
+    # Build params for the actual provider call
+    call_params = {
+        "model": model,
+        "prompt": params.get("prompt", ""),
+        "budget": params.get("budget", {}),
+        "agent_id": params.get("agent_id", ctx.agent_id),
+    }
+    if params.get("cwd_override"):
+        call_params["cwd_override"] = params["cwd_override"]
+
+    # Dispatch
+    action_fn = get_action(action_name)
+    result = action_fn(call_params, ctx)
+
+    # If Gemini got capped, fall back automatically
+    if result.get("gemini_capped"):
+        log.warning("Gemini capped mid-call, falling back")
+
+        # Re-run provider selection — gemini_is_available() now returns False
+        assessment = params.get("assessment", routing)  # best we have
+        fallback_routing = action_select_provider({
+            "assessment": assessment,
+            "budget": params.get("budget", {}),
+        }, ctx)
+
+        log.info(f"  Fallback: {fallback_routing['provider']} ({fallback_routing['reason']})")
+
+        call_params["model"] = fallback_routing["model"]
+        fallback_fn = get_action(fallback_routing["action"])
+        result = fallback_fn(call_params, ctx)
+
+        # Record that we fell back
+        result["_routing"] = {
+            **routing,
+            "fallback_from": "gemini",
+            "fallback_to": fallback_routing["provider"],
+            "fallback_reason": "gemini_rate_limited",
+        }
+    else:
+        result["_routing"] = routing
+
+    return result
 
 
 @register_action("llm.call")
@@ -315,27 +539,9 @@ def action_llm_call(params: dict, ctx: RunContext) -> dict:
     prompt_file.write_text(prompt, encoding="utf-8")
 
     try:
-        # cwd_override skips agent config and CLAUDE.md loading entirely
-        cwd_override = params.get("cwd_override")
-
-        # Read agent config for cwd and additional directories
-        config_path = REPO_ROOT / ".agents" / _agent_dir(agent_id) / "config.json"
-        cwd = str(REPO_ROOT)
+        # Working directory from params, env, or project root
+        cwd = params.get("cwd_override", os.environ.get("FLOW_RUNNER_CWD", str(PROJECT_ROOT)))
         add_dirs = ""
-
-        if cwd_override:
-            cwd = cwd_override
-            # No add_dirs when using override — clean environment
-        elif config_path.exists():
-            try:
-                config = json.loads(config_path.read_text(encoding="utf-8"))
-                session_cfg = config.get("session_config", {})
-                if session_cfg.get("cwd"):
-                    cwd = session_cfg["cwd"]
-                for d in session_cfg.get("additional_directories", []):
-                    add_dirs += f' --add-dir "{d}"'
-            except Exception:
-                pass
 
         cmd = f'cat "{prompt_file}" | claude -p --output-format json {model_flag}{add_dirs}'
 
@@ -373,18 +579,6 @@ def action_llm_call(params: dict, ctx: RunContext) -> dict:
 
     finally:
         prompt_file.unlink(missing_ok=True)
-
-
-def _agent_dir(agent_id: str) -> str:
-    """Map agent_id (e.g. 'sap', 'coord') to directory name."""
-    dir_map = {
-        "coord": "saruman", "sap": "radagast", "dotnet": "gandalf",
-        "ui": "legolas", "data": "gimli", "qa": "aragorn",
-        "devex": "elrond", "optim": "frodo", "docs": "bilbo",
-        "ideas": "pippin", "architect": "merry", "finance": "theoden",
-        "abap": "galadriel", "notes": "sam", "strategy": "faramir",
-    }
-    return dir_map.get(agent_id, agent_id)
 
 
 def _parse_claude_output(raw: str, model: str, wall_ms: int) -> dict:
@@ -485,6 +679,37 @@ GEMINI_MODELS = {
     "gemini-pro": "gemini-pro-latest",
 }
 
+# Gemini rate-limit state — in-memory flag with cooldown
+_gemini_capped = False
+_gemini_capped_until = 0.0  # epoch timestamp
+GEMINI_CAP_COOLDOWN_S = 60  # retry after 60s for RPM, longer for quota
+
+
+def gemini_is_available() -> bool:
+    """Check if Gemini is currently available (not rate-capped)."""
+    global _gemini_capped, _gemini_capped_until
+    if not _gemini_capped:
+        return bool(GEMINI_API_KEY)
+    if time.time() >= _gemini_capped_until:
+        _gemini_capped = False
+        log.info("Gemini cap cooldown expired, re-enabling")
+        return bool(GEMINI_API_KEY)
+    return False
+
+
+def _gemini_set_capped(status_code: int):
+    """Flag Gemini as capped after a 429 or 403."""
+    global _gemini_capped, _gemini_capped_until
+    _gemini_capped = True
+    if status_code == 429:
+        # RPM/TPM limit — short cooldown
+        _gemini_capped_until = time.time() + GEMINI_CAP_COOLDOWN_S
+        log.warning(f"Gemini rate-limited (429), cooling down for {GEMINI_CAP_COOLDOWN_S}s")
+    else:
+        # 403 = quota exhausted — longer cooldown (1 hour)
+        _gemini_capped_until = time.time() + 3600
+        log.warning("Gemini quota exhausted (403), cooling down for 1h")
+
 
 @register_action("llm.call_gemini")
 def action_llm_call_gemini(params: dict, ctx: RunContext) -> dict:
@@ -526,6 +751,22 @@ def action_llm_call_gemini(params: dict, ctx: RunContext) -> dict:
             "is_error": False,
         }
 
+    if not GEMINI_API_KEY:
+        return {
+            "provider": "gemini",
+            "text": "",
+            "model": model_key,
+            "total_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "thinking_tokens": 0,
+            "duration_ms": 0,
+            "cost": 0.0,
+            "stop_reason": "error",
+            "is_error": True,
+            "error": "GEMINI_API_KEY not set in environment",
+        }
+
     model_id = GEMINI_MODELS.get(model_key, model_key)
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent"
 
@@ -547,6 +788,24 @@ def action_llm_call_gemini(params: dict, ctx: RunContext) -> dict:
             timeout=120.0,
         )
         wall_ms = int((time.time() - start_time) * 1000)
+
+        if resp.status_code in (429, 403):
+            _gemini_set_capped(resp.status_code)
+            return {
+                "provider": "gemini",
+                "text": "",
+                "model": model_id,
+                "total_tokens": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "thinking_tokens": 0,
+                "duration_ms": wall_ms,
+                "cost": 0.0,
+                "stop_reason": "rate_limited",
+                "is_error": True,
+                "gemini_capped": True,
+                "error": f"HTTP {resp.status_code}: {resp.text[:300]}",
+            }
 
         if resp.status_code != 200:
             return {
@@ -639,7 +898,7 @@ def action_llm_call_codex(params: dict, ctx: RunContext) -> dict:
     model = params.get("model", "")  # empty = default (ChatGPT account default)
     prompt = params.get("prompt", "")
     budget = params.get("budget", {})
-    cwd = params.get("cwd_override", "C:/tmp/flow-sandbox")
+    cwd = params.get("cwd_override", os.environ.get("CODEX_SANDBOX_DIR", str(Path.home() / "flow-sandbox")))
 
     if budget.get("status") == "blocked":
         return {
@@ -829,4 +1088,260 @@ def _parse_codex_output(raw: str, model: str, wall_ms: int) -> dict:
         "errors": errors if errors else None,
         # Raw event count for debugging
         "event_count": len(events),
+    }
+
+
+# ── Routing Scorecard (automatic, zero-cost signals) ─────────────
+
+@register_action("routing.scorecard")
+def action_routing_scorecard(params: dict, ctx: RunContext) -> dict:
+    """Compute objective routing quality signals from the LLM result.
+
+    No LLM call — pure math on data we already have.
+    """
+    llm_result = params.get("llm_result", {})
+    routing = params.get("routing", {})
+    assessment = params.get("assessment", {})
+
+    input_tokens = llm_result.get("input_tokens", 0)
+    output_tokens = llm_result.get("output_tokens", 0)
+    is_error = llm_result.get("is_error", False)
+    stop_reason = llm_result.get("stop_reason", "")
+
+    # Engagement ratio: did the model actually produce meaningful output?
+    engagement_ratio = (output_tokens / input_tokens) if input_tokens > 0 else 0.0
+
+    # Signals
+    call_succeeded = not is_error and stop_reason not in ("error", "budget_blocked", "rate_limited", "timeout")
+    produced_output = output_tokens > 50  # more than a refusal
+    engaged = engagement_ratio > 0.02     # at least 2% ratio
+    fell_back = bool(routing.get("fallback_from"))
+
+    # Composite score: 0-4 (each signal is worth 1 point)
+    score = sum([call_succeeded, produced_output, engaged, not fell_back])
+
+    # Suspect misroute if the model produced almost nothing or errored
+    likely_misrouted = call_succeeded and not produced_output
+
+    scorecard = {
+        "score": score,
+        "max_score": 4,
+        "call_succeeded": call_succeeded,
+        "produced_output": produced_output,
+        "engaged": engaged,
+        "engagement_ratio": round(engagement_ratio, 4),
+        "fell_back": fell_back,
+        "likely_misrouted": likely_misrouted,
+        "provider": routing.get("provider", "unknown"),
+        "model": llm_result.get("model", "unknown"),
+        "complexity": assessment.get("complexity", "unknown"),
+        "cost_rank": routing.get("cost_rank", -1),
+    }
+
+    log.info(f"  routing.scorecard: score={score}/4, "
+             f"provider={scorecard['provider']}, "
+             f"engaged={engaged}, "
+             f"misrouted={likely_misrouted}")
+
+    return scorecard
+
+
+# ── Eval: LLM-as-Judge (on-demand, end-of-week) ──────────────────
+#
+# Not run automatically. Triggered via:
+#   uv run flow-run eval-routing.yaml
+# when the week is closing and there's usage budget left to burn.
+
+EVAL_PROMPT_TEMPLATE = """You are evaluating whether an AI model was a good fit for a task.
+
+## Task given to the model
+{task_summary}
+
+## Model used
+Provider: {provider}, Model: {model}
+Complexity assessed as: {complexity}
+Routing reason: {routing_reason}
+
+## Model output (first 2000 chars)
+{output_preview}
+
+## Evaluation
+Answer these three questions with ONLY the JSON format shown below. No other text.
+
+```json
+{{
+  "quality": <1-5 integer, 1=useless 3=adequate 5=excellent>,
+  "could_simpler_handle": <true if a cheaper/simpler model would produce equivalent results>,
+  "was_misrouted": <true if this task needed a more capable model than was used>,
+  "reasoning": "<one sentence explaining your rating>"
+}}
+```"""
+
+
+@register_action("eval.judge")
+def action_eval_judge(params: dict, ctx: RunContext) -> dict:
+    """On-demand LLM-as-judge evaluation of routing quality.
+
+    Run at end-of-week when usage budget has headroom. Evaluates flow_run
+    records that have stored content (prompt_text + response_text from
+    flow_run_content table).
+
+    Tiered judging:
+      - Gemini Pro as primary judge (free)
+      - Opus as calibration judge (optional, set calibrate=true)
+    """
+    flow_runs = params.get("flow_runs", [])
+    calibrate = params.get("calibrate", False)
+
+    if not flow_runs:
+        return {"evaluated": 0, "reason": "no flow_runs provided"}
+
+    results = []
+
+    for run in (flow_runs if isinstance(flow_runs, list) else []):
+        run_id = run.get("id", "?")
+        provider = run.get("provider", "?")
+        model = run.get("model", "?")
+        flow_name = run.get("flow_name", "?")
+
+        # Full content from flow_run_content join
+        prompt_text = run.get("prompt_text", "")
+        response_text = run.get("response_text", "")
+
+        if not response_text:
+            log.info(f"  eval.judge: skipping run {run_id} — no stored content")
+            continue
+
+        # Use the prompt as the task summary (first 1000 chars),
+        # and the response as the output to judge
+        eval_prompt = EVAL_PROMPT_TEMPLATE.format(
+            task_summary=prompt_text[:1000],
+            provider=provider,
+            model=model,
+            complexity=run.get("complexity", "unknown"),
+            routing_reason=run.get("routing_reason", "unknown"),
+            output_preview=response_text[:2000],
+        )
+
+        entry = {"run_id": run_id, "provider": provider, "model": model}
+
+        # Gemini Pro eval (free)
+        if gemini_is_available():
+            log.info(f"  eval.judge: Gemini Pro evaluating run {run_id}")
+            gemini_result = action_llm_call_gemini(
+                {"model": "gemini-pro", "prompt": eval_prompt, "budget": {"status": "ok"}},
+                ctx,
+            )
+            gemini_eval = _parse_eval_response(gemini_result.get("text", ""))
+            gemini_eval["judge_model"] = "gemini-pro"
+            gemini_eval["judge_tokens"] = gemini_result.get("total_tokens", 0)
+            gemini_eval["judge_cost"] = 0.0
+            entry["gemini_pro"] = gemini_eval
+        else:
+            log.warning(f"  eval.judge: Gemini unavailable for run {run_id}")
+
+        # Opus calibration (optional)
+        if calibrate and not ctx.dry_run:
+            log.info(f"  eval.judge: Opus calibrating run {run_id}")
+            opus_result = action_llm_call(
+                {"model": "opus", "prompt": eval_prompt, "budget": {"status": "ok"},
+                 "agent_id": ctx.agent_id},
+                ctx,
+            )
+            opus_eval = _parse_eval_response(opus_result.get("text", ""))
+            opus_eval["judge_model"] = "opus"
+            opus_eval["judge_tokens"] = opus_result.get("total_tokens", 0)
+            opus_eval["judge_cost"] = opus_result.get("cost", 0.0)
+            entry["opus"] = opus_eval
+
+        results.append(entry)
+
+    return {
+        "evaluated": len(results),
+        "calibrated": calibrate,
+        "results": results,
+    }
+
+
+@register_action("eval.store")
+def action_eval_store(params: dict, ctx: RunContext) -> dict:
+    """Store eval results to routing_eval table."""
+    eval_results = params.get("results", {})
+    entries = eval_results.get("results", [])
+    stored = 0
+
+    for entry in entries:
+        run_id = entry.get("run_id", "")
+        if not run_id or run_id == "?":
+            continue
+
+        for judge_key in ("gemini_pro", "opus"):
+            eval_data = entry.get(judge_key)
+            if not eval_data:
+                continue
+
+            quality = eval_data.get("quality", -1)
+            could_simpler = eval_data.get("could_simpler_handle")
+            was_misrouted = eval_data.get("was_misrouted")
+            reasoning = eval_data.get("reasoning", "")
+            judge_model = eval_data.get("judge_model", judge_key)
+            judge_tokens = eval_data.get("judge_tokens", 0)
+            judge_cost = eval_data.get("judge_cost", 0.0)
+            parse_error = eval_data.get("parse_error", False)
+
+            could_simpler_sql = str(could_simpler).lower() if could_simpler is not None else "NONE"
+            was_misrouted_sql = str(was_misrouted).lower() if was_misrouted is not None else "NONE"
+
+            try:
+                ctx.db.query(
+                    f"CREATE routing_eval SET "
+                    f"flow_run = {run_id}, "
+                    f"judge_model = '{judge_model}', "
+                    f"quality = {quality}, "
+                    f"could_simpler_handle = {could_simpler_sql}, "
+                    f"was_misrouted = {was_misrouted_sql}, "
+                    f"reasoning = '{_esc(reasoning)}', "
+                    f"judge_tokens = {judge_tokens}, "
+                    f"judge_cost = {judge_cost}, "
+                    f"parse_error = {str(parse_error).lower()};"
+                )
+                stored += 1
+            except Exception as e:
+                log.warning(f"  eval.store: failed to store eval for {run_id}/{judge_key}: {e}")
+
+    return {"stored": stored, "total_entries": len(entries)}
+
+
+def _parse_eval_response(text: str) -> dict:
+    """Extract JSON eval from judge response."""
+    # Try to find JSON block in response
+    try:
+        # Look for ```json ... ``` block
+        import re
+        json_match = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
+        if json_match:
+            return json.loads(json_match.group(1))
+
+        # Try parsing the whole thing as JSON
+        # Strip any leading/trailing non-JSON
+        stripped = text.strip()
+        if stripped.startswith("{"):
+            brace_depth = 0
+            for i, c in enumerate(stripped):
+                if c == "{":
+                    brace_depth += 1
+                elif c == "}":
+                    brace_depth -= 1
+                    if brace_depth == 0:
+                        return json.loads(stripped[:i + 1])
+
+    except (json.JSONDecodeError, Exception) as e:
+        log.warning(f"  eval: failed to parse judge response: {e}")
+
+    return {
+        "quality": -1,
+        "could_simpler_handle": None,
+        "was_misrouted": None,
+        "reasoning": f"Parse error: {text[:200]}",
+        "parse_error": True,
     }

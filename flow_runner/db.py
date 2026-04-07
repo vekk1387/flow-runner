@@ -4,17 +4,18 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any
 
 import httpx
 
 log = logging.getLogger(__name__)
 
-DEFAULT_HOST = "http://localhost:8282"
-DEFAULT_NS = "agent_build"
-DEFAULT_DB = "main"
-DEFAULT_USER = "root"
-DEFAULT_PASS = "root"
+DEFAULT_HOST = os.environ.get("SURREAL_HOST", "http://localhost:8282")
+DEFAULT_NS = os.environ.get("SURREAL_NS", "flow_runner")
+DEFAULT_DB = os.environ.get("SURREAL_DB", "main")
+DEFAULT_USER = os.environ.get("SURREAL_USER", "root")
+DEFAULT_PASS = os.environ.get("SURREAL_PASS", "root")
 
 
 class SurrealClient:

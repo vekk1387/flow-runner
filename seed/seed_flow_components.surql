@@ -91,3 +91,21 @@ CREATE model_config SET
   output_cost_per_mtok = 4.0,
   max_tokens = 8192,
   tier = 'fast';
+
+-- ============================================================
+-- Eval Stored Queries
+-- ============================================================
+
+-- Recent flow runs for eval (joins with content)
+CREATE stored_query SET
+  key = 'recent_flow_runs_for_eval',
+  description = 'Fetch recent completed flow runs with stored content for eval',
+  sql = 'SELECT fr.*, frc.prompt_text, frc.response_text FROM flow_run AS fr LEFT JOIN flow_run_content AS frc ON frc.flow_run = fr.id WHERE fr.status = \'completed\' AND fr.id NOT IN (SELECT flow_run FROM routing_eval) ORDER BY fr.started_at DESC LIMIT $limit;',
+  params = ['limit'];
+
+-- Store routing eval results
+CREATE stored_query SET
+  key = 'store_routing_evals',
+  description = 'Placeholder - eval storage handled by eval.store action',
+  sql = 'SELECT 1;',
+  params = [];

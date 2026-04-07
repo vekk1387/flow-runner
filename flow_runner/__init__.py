@@ -1,1 +1,1 @@
-"""Flow Runner — YAML-configured pipeline engine for agent orchestration."""
+"""Flow Runner — YAML-configured pipeline engine with multi-provider LLM routing."""

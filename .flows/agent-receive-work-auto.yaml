@@ -1,0 +1,129 @@
+flow: agent-receive-work-auto
+version: 1
+description: >
+  Unified agent execution flow with zero-cost provider routing.
+  Automatically selects the cheapest provider that can handle the task:
+  Gemini (free) > Codex (subscription) > Claude (metered).
+trigger: dispatch_go
+
+steps:
+  - id: check_budget
+    action: budget.check
+    params: {}
+    output: budget
+
+  - id: read_inbox
+    action: db.query
+    params:
+      query_key: agent_inbox
+      bind:
+        agent_id: "{{agent_id}}"
+    output: inbox
+
+  - id: load_persona
+    action: db.query
+    params:
+      query_key: agent_persona
+      bind:
+        agent_id: "{{agent_id}}"
+    output: persona
+
+  - id: load_instructions
+    action: db.query
+    params:
+      query_key: agent_instructions
+      bind:
+        agent_id: "{{agent_id}}"
+    output: instructions
+
+  - id: load_recent_activity
+    action: db.query
+    params:
+      query_key: agent_recent_activity
+      bind:
+        agent_id: "{{agent_id}}"
+    output: recent_activity
+
+  - id: assess_complexity
+    action: routing.assess
+    params:
+      tasks: "{{inbox.tasks}}"
+      messages: "{{inbox.messages}}"
+      persona: "{{persona}}"
+    output: assessment
+    # Returns: complexity, model_tier, estimated_tokens,
+    #          needs_tool_use, needs_repo_context, is_code_heavy
+
+  - id: select_provider
+    action: routing.select_provider
+    params:
+      assessment: "{{assessment}}"
+      budget: "{{budget}}"
+      model_override: "{{model_override}}"
+      provider_override: "{{provider_override}}"
+    output: routing
+    # Returns: provider, action, model, reason, cost_rank
+    # Zero cost — pure Python rules, no LLM call
+    # Budget pressure triggers Codex offload at session>60% or weekly>70%
+
+  - id: build_prompt
+    action: prompt.build
+    params:
+      persona: "{{persona}}"
+      instructions: "{{instructions}}"
+      tasks: "{{inbox.tasks}}"
+      messages: "{{inbox.messages}}"
+      recent_activity: "{{recent_activity}}"
+      assessment: "{{assessment}}"
+      model_override: "{{routing.model}}"
+    output: prompt_payload
+
+  - id: call_model
+    action: llm.call_auto
+    params:
+      routing: "{{routing}}"
+      prompt: "{{prompt_payload.user_prompt}}"
+      agent_id: "{{agent_id}}"
+      budget: "{{budget}}"
+      cwd_override: "{{cwd_override}}"
+    output: llm_result
+    audit: full
+
+  - id: scorecard
+    action: routing.scorecard
+    params:
+      llm_result: "{{llm_result}}"
+      routing: "{{routing}}"
+      assessment: "{{assessment}}"
+    output: scorecard
+    # Zero cost — pure math on existing data
+    # Returns: score (0-4), engagement_ratio, likely_misrouted, etc.
+
+  - id: store_result
+    action: db.query
+    params:
+      query_key: log_run
+      bind:
+        agent_id: "{{agent_id}}"
+        task_id: "{{inbox.tasks[0].id}}"
+        model: "{{llm_result.model}}"
+        total_tokens: "{{llm_result.total_tokens}}"
+        duration_ms: "{{llm_result.duration_ms}}"
+        cost: "{{llm_result.cost}}"
+        num_turns: "{{llm_result.num_turns}}"
+    output: run_record
+
+  - id: log_completion
+    action: db.query
+    params:
+      query_key: log_activity
+      bind:
+        agent_id: "{{agent_id}}"
+        action: DONE
+        description: "Flow completed via {{routing.provider}} ({{routing.reason}}) score={{scorecard.score}}/4"
+        related_task: "{{inbox.tasks[0].id}}"
+        model: "{{llm_result.model}}"
+        tokens: "{{llm_result.total_tokens}}"
+        duration_ms: "{{llm_result.duration_ms}}"
+        cost: "{{llm_result.cost}}"
+    output: activity_record

@@ -1,0 +1,55 @@
+flow: eval-routing
+version: 1
+description: >
+  On-demand routing quality evaluation. Run at end-of-week when usage budget
+  has headroom. Pulls recent flow_run records + their full content from DB,
+  judges them with Gemini Pro (free) and optionally Opus (calibration).
+
+  Usage:
+    uv run flow-run eval-routing.yaml --agent coord
+    uv run flow-run eval-routing.yaml --agent coord --model opus  # enables Opus calibration
+trigger: manual
+
+steps:
+  - id: check_budget
+    action: budget.check
+    params: {}
+    output: budget
+
+  - id: load_recent_runs
+    action: db.query
+    params:
+      query_key: recent_flow_runs_for_eval
+      bind:
+        limit: "20"
+    output: recent_runs
+    # Stored query should join flow_run with flow_run_content:
+    #   SELECT fr.*, frc.prompt_text, frc.response_text
+    #   FROM flow_run fr
+    #   LEFT JOIN flow_run_content frc ON frc.flow_run = fr.id
+    #   WHERE fr.status = 'completed'
+    #   AND fr.id NOT IN (SELECT flow_run FROM routing_eval)
+    #   ORDER BY fr.started_at DESC LIMIT $limit
+
+  - id: evaluate
+    action: eval.judge
+    params:
+      flow_runs: "{{recent_runs}}"
+      calibrate: "{{calibrate}}"
+    output: eval_results
+
+  - id: store_evals
+    action: eval.store
+    params:
+      results: "{{eval_results}}"
+    output: stored
+
+  - id: log_completion
+    action: db.query
+    params:
+      query_key: log_activity
+      bind:
+        agent_id: "{{agent_id}}"
+        action: EVAL
+        description: "Routing eval: {{eval_results.evaluated}} runs evaluated, calibrated={{eval_results.calibrated}}"
+    output: activity_record
