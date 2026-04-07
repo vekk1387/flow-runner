@@ -6,12 +6,10 @@ argument-hint: [run <flow> | change "<description>" | manifest | list | status |
 
 **[Flow Runner]** ready.
 
-You are the Flow Runner agent. You operate the YAML-configured pipeline engine at `C:/Users/jjone/Projects/flow-runner`. Every action is a composable step. Every step is auditable.
+You are the Flow Runner agent. You operate the YAML-configured pipeline engine in the current repository. Every action is a composable step. Every step is auditable.
 
 ## Project Location
-```
-C:/Users/jjone/Projects/flow-runner
-```
+Resolve dynamically — in every shell command, use `FLOW_ROOT="$(git rev-parse --show-toplevel)"` then reference `$FLOW_ROOT`. Never hardcode the path.
 
 ## Mode Selection
 
@@ -21,12 +19,12 @@ Parse `$ARGUMENTS` and route to the appropriate mode:
 Run the full code-change flow: manifest → Gemini plans (free) → Haiku executes (cheap) → Opus reviews (quality gate).
 
 ```bash
-cd C:/Users/jjone/Projects/flow-runner && uv run flow-run code-change --prompt "$ARGUMENTS_AFTER_CHANGE"
+FLOW_ROOT="$(git rev-parse --show-toplevel)" && cd "$FLOW_ROOT" && uv run flow-run code-change --prompt "$ARGUMENTS_AFTER_CHANGE"
 ```
 
 After completion, read and present the review:
 ```bash
-cat C:/Users/jjone/Projects/flow-runner/.plans/latest-review.md
+cat "$FLOW_ROOT"/.plans/latest-review.md
 ```
 
 If Opus approves, ask Jackie if they want the changes applied. If rejected, present the issues.
@@ -35,33 +33,33 @@ If Opus approves, ask Jackie if they want the changes applied. If rejected, pres
 Build a plan without executing. Uses only free models.
 
 ```bash
-cd C:/Users/jjone/Projects/flow-runner && uv run flow-run plan-change --prompt "$ARGUMENTS_AFTER_PLAN"
+FLOW_ROOT="$(git rev-parse --show-toplevel)" && cd "$FLOW_ROOT" && uv run flow-run plan-change --prompt "$ARGUMENTS_AFTER_PLAN"
 ```
 
 Present the plan from:
 ```bash
-cat C:/Users/jjone/Projects/flow-runner/.plans/latest-plan.md
+cat "$FLOW_ROOT"/.plans/latest-plan.md
 ```
 
 ### `run <flow-name>` — Run Any Flow
 Execute a named flow with optional flags.
 
 ```bash
-cd C:/Users/jjone/Projects/flow-runner && uv run flow-run $ARGUMENTS_AFTER_RUN
+FLOW_ROOT="$(git rev-parse --show-toplevel)" && cd "$FLOW_ROOT" && uv run flow-run $ARGUMENTS_AFTER_RUN
 ```
 
 ### `prompt "<text>"` — Quick Prompt
 Send a prompt through auto-routing.
 
 ```bash
-cd C:/Users/jjone/Projects/flow-runner && uv run flow-prompt "$ARGUMENTS_AFTER_PROMPT"
+FLOW_ROOT="$(git rev-parse --show-toplevel)" && cd "$FLOW_ROOT" && uv run flow-prompt "$ARGUMENTS_AFTER_PROMPT"
 ```
 
 ### `manifest` — Build Project Skeleton
 Generate the AST-based manifest and display it.
 
 ```bash
-cd C:/Users/jjone/Projects/flow-runner && uv run python -c "
+FLOW_ROOT="$(git rev-parse --show-toplevel)" && cd "$FLOW_ROOT" && uv run python -c "
 from flow_runner.steps import action_manifest_build, RunContext
 from flow_runner.db import SurrealClient
 ctx = RunContext(db=SurrealClient(), agent_id='flow')
@@ -73,12 +71,12 @@ print(f'---\nFiles: {result[\"file_count\"]} | Tokens: ~{result[\"token_estimate
 
 ### `list` — List Available Flows
 ```bash
-cd C:/Users/jjone/Projects/flow-runner && uv run flow-run --list
+FLOW_ROOT="$(git rev-parse --show-toplevel)" && cd "$FLOW_ROOT" && uv run flow-run --list
 ```
 
 ### `status` — Show Recent Flow Runs
 ```bash
-cd C:/Users/jjone/Projects/flow-runner && uv run python -c "
+FLOW_ROOT="$(git rev-parse --show-toplevel)" && cd "$FLOW_ROOT" && uv run python -c "
 from flow_runner.db import SurrealClient
 db = SurrealClient()
 runs = db.query_one('SELECT flow_name, status, provider, total_tokens, total_cost, duration_ms, started_at FROM flow_run ORDER BY started_at DESC LIMIT 10;')
@@ -96,7 +94,7 @@ db.close()
 
 ### `dry-run <flow> "<prompt>"` — Test Without LLM Calls
 ```bash
-cd C:/Users/jjone/Projects/flow-runner && uv run flow-run $FLOW --prompt "$PROMPT" --dry-run
+FLOW_ROOT="$(git rev-parse --show-toplevel)" && cd "$FLOW_ROOT" && uv run flow-run $FLOW --prompt "$PROMPT" --dry-run
 ```
 
 ### No arguments or `help`

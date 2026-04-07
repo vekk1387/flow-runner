@@ -1,0 +1,11 @@
+[package]
+name = "flow-builder"
+version = "0.1.0"
+edition = "2021"
+description = "Visual YAML flow builder for the flow-runner pipeline engine"
+
+[dependencies]
+eframe = "0.31"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+rfd = "0.15"               # native file dialogs

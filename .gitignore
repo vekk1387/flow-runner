@@ -7,3 +7,6 @@ dist/
 .python-version
 uv.lock
 data/
+
+# Rust
+target/
