@@ -1,0 +1,200 @@
+flow: code-change
+version: 1
+description: >
+  End-to-end code change pipeline with Opus review gate.
+  1. Build manifest (free, local)
+  2. Gemini Flash selects relevant files (free)
+  3. Gemini Pro writes the implementation plan (free)
+  4. Haiku executes the plan — writes actual code (cheap)
+  5. Opus reviews the result (quality gate)
+  All costs tracked. Full audit trail.
+
+  Usage:
+    uv run flow-run code-change --prompt "Add Ollama as a local LLM provider"
+    uv run flow-run code-change --prompt "Add a retry mechanism to Gemini calls" --dry-run
+trigger: manual
+
+steps:
+  # ── Phase 1: Understand (FREE) ──────────────────────────────────
+  - id: build_manifest
+    action: manifest.build
+    params:
+      paths: ["flow_runner/", ".flows/", "schema/", "seed/"]
+    output: manifest
+
+  - id: select_files
+    action: llm.call_gemini
+    params:
+      model: gemini-flash
+      prompt: |
+        You are a code routing assistant. Given a project manifest and a change request,
+        identify which files need to be READ and which need to be MODIFIED.
+
+        ## Project Manifest
+        {{manifest.text}}
+
+        ## Change Request
+        {{prompt_text}}
+
+        Respond with ONLY this JSON, no other text:
+        ```json
+        {
+          "read": ["path/to/file.py"],
+          "modify": ["path/to/file.py"],
+          "approach": "one sentence",
+          "complexity": "low|medium|high"
+        }
+        ```
+      budget: {}
+    output: file_selection
+
+  - id: load_context
+    action: context.select
+    params:
+      manifest: "{{manifest}}"
+      selection: "{{file_selection.text}}"
+    output: context
+
+  # ── Phase 2: Plan (FREE) ────────────────────────────────────────
+  - id: plan_changes
+    action: llm.call_gemini
+    params:
+      model: gemini-pro
+      prompt: |
+        You are a senior engineer planning a code change. You have the full source
+        of every relevant file. Write a precise implementation plan.
+
+        ## Change Request
+        {{prompt_text}}
+
+        ## Source Files
+        {{context.files}}
+
+        ## Instructions
+        For each file that needs to change, specify:
+        1. File path
+        2. The exact existing code block to find (copy verbatim from source)
+        3. The replacement code block (complete, working code)
+        4. Brief rationale
+
+        Use this format for each change:
+        ### File: <path>
+        #### Find:
+        ```
+        <exact existing code>
+        ```
+        #### Replace with:
+        ```
+        <new code>
+        ```
+        #### Why: <rationale>
+
+        Be precise. Copy existing code exactly so changes can be applied mechanically.
+        Do not omit unchanged code with "..." — show the full block.
+      budget: {}
+    output: plan
+    audit: full
+
+  - id: save_plan
+    action: file.write
+    params:
+      path: ".plans/latest-plan.md"
+      content: "# Plan: {{prompt_text}}\n\n{{plan.text}}"
+    output: plan_saved
+
+  # ── Phase 3: Execute (CHEAP — Haiku) ────────────────────────────
+  - id: execute_changes
+    action: llm.call
+    params:
+      model: haiku
+      prompt: |
+        You are a code executor. Apply the following change plan exactly as specified.
+        Do not improvise or add anything beyond what the plan says.
+
+        ## Change Plan
+        {{plan.text}}
+
+        ## Current Source Files
+        {{context.files}}
+
+        Apply every change from the plan. For each file, output the COMPLETE
+        modified file content in this format:
+
+        ### FILE: <path>
+        ```
+        <complete file content after changes>
+        ```
+
+        Output every modified file in full. Do not abbreviate.
+      budget: {}
+    output: execution
+    audit: full
+
+  - id: save_execution
+    action: file.write
+    params:
+      path: ".plans/latest-execution.md"
+      content: "# Execution: {{prompt_text}}\n\n{{execution.text}}"
+    output: execution_saved
+
+  # ── Phase 4: Review (OPUS — quality gate) ───────────────────────
+  - id: opus_review
+    action: llm.call
+    params:
+      model: opus
+      prompt: |
+        You are a senior code reviewer. A change was planned by one model and
+        executed by another. Review the result for correctness, completeness,
+        and quality.
+
+        ## Original Change Request
+        {{prompt_text}}
+
+        ## Plan (written by Gemini Pro)
+        {{plan.text}}
+
+        ## Execution (written by Haiku)
+        {{execution.text}}
+
+        ## Original Source (before changes)
+        {{context.files}}
+
+        ## Review Criteria
+        1. Does the execution correctly implement the plan?
+        2. Does it introduce any bugs, security issues, or regressions?
+        3. Is anything missing from the original change request?
+        4. Does the code follow the existing patterns in the codebase?
+        5. Would you approve this as a merge-ready change?
+
+        Respond with ONLY this JSON, no other text:
+        ```json
+        {
+          "verdict": "approve|request_changes|reject",
+          "score": <1-10>,
+          "plan_quality": <1-10>,
+          "execution_quality": <1-10>,
+          "issues": ["issue 1", "issue 2"],
+          "missing": ["anything the plan/execution missed"],
+          "would_merge": true|false,
+          "summary": "2-3 sentence review summary"
+        }
+        ```
+      budget: {}
+    output: review
+    audit: full
+
+  - id: save_review
+    action: file.write
+    params:
+      path: ".plans/latest-review.md"
+      content: "# Review: {{prompt_text}}\n\nVerdict: {{review.text}}"
+    output: review_saved
+
+  # ── Phase 5: Scorecard ──────────────────────────────────────────
+  - id: scorecard
+    action: routing.scorecard
+    params:
+      llm_result: "{{execution}}"
+      routing: {"provider": "claude", "model": "haiku", "cost_rank": 2}
+      assessment: {"complexity": "medium"}
+    output: scorecard
