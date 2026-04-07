@@ -1,0 +1,101 @@
+flow: plan-change
+version: 1
+description: >
+  Manifest-driven change planning. Builds a project skeleton (~2K tokens),
+  sends it to Gemini (free) to identify relevant files, then reads only
+  those files and sends to a working model for execution planning.
+
+  Usage:
+    uv run flow-run plan-change --prompt "Add Ollama as a local provider"
+    uv run flow-run plan-change --prompt "Update schema to add a status field" --model sonnet
+trigger: manual
+
+steps:
+  - id: build_manifest
+    action: manifest.build
+    params:
+      paths: ["flow_runner/", ".flows/", "schema/", "seed/"]
+    output: manifest
+    # ~2K tokens: file names, functions, classes, flow steps, DB tables
+
+  - id: select_files
+    action: llm.call_gemini
+    params:
+      model: gemini-flash
+      prompt: |
+        You are a code routing assistant. Given a project manifest and a change request,
+        identify which files need to be READ to understand the change, and which files
+        need to be MODIFIED.
+
+        ## Project Manifest
+        {{manifest.text}}
+
+        ## Change Request
+        {{prompt_text}}
+
+        Respond with ONLY this JSON format, no other text:
+        ```json
+        {
+          "read": ["path/to/file1.py", "path/to/file2.yaml"],
+          "modify": ["path/to/file3.py"],
+          "approach": "one sentence describing the implementation approach",
+          "complexity": "low|medium|high"
+        }
+        ```
+      budget: {}
+    output: file_selection
+    # FREE — Gemini Flash, ~3K tokens total
+
+  - id: parse_selection
+    action: context.select
+    params:
+      manifest: "{{manifest}}"
+      selection: "{{file_selection.text}}"
+    output: context
+    # Reads only the files Gemini identified
+
+  - id: build_change_plan
+    action: llm.call_auto
+    params:
+      routing:
+        provider: "{{provider_override}}"
+        action: "llm.call_gemini"
+        model: "gemini-pro"
+        reason: "Change planning — Gemini Pro (free)"
+        cost_rank: 0
+      prompt: |
+        You are planning a code change. You have the project structure and the
+        relevant source files. Create a detailed implementation plan.
+
+        ## Change Request
+        {{prompt_text}}
+
+        ## Relevant Files
+        {{context.files}}
+
+        ## Plan Format
+        For each file that needs to change:
+        1. File path
+        2. What to add/modify/remove
+        3. Where in the file (reference line numbers from the source)
+        4. The actual code to write (complete, not pseudocode)
+
+        Be specific. Reference line numbers. Write real code.
+      budget: {}
+    output: change_plan
+    audit: full
+
+  - id: save_plan
+    action: file.write
+    params:
+      path: ".plans/latest.md"
+      content: "# Change Plan\n\n## Request\n{{prompt_text}}\n\n## Plan\n{{change_plan.text}}"
+    output: saved
+
+  - id: scorecard
+    action: routing.scorecard
+    params:
+      llm_result: "{{change_plan}}"
+      routing: {"provider": "gemini", "cost_rank": 0}
+      assessment: {"complexity": "medium"}
+    output: scorecard

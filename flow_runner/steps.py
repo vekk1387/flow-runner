@@ -1345,3 +1345,327 @@ def _parse_eval_response(text: str) -> dict:
         "reasoning": f"Parse error: {text[:200]}",
         "parse_error": True,
     }
+
+
+# ── Manifest: AST-based project skeleton ──────────────────────────
+
+import ast
+import re as _re
+
+
+@register_action("manifest.build")
+def action_manifest_build(params: dict, ctx: RunContext) -> dict:
+    """Build a structural manifest of the project via AST parsing.
+
+    Scans Python, YAML, SQL, TOML files and extracts classes, functions,
+    decorators, flow steps, DB tables — no file contents, just structure.
+
+    Returns {text: str, files: list, token_estimate: int}.
+    """
+    import yaml as _yaml
+
+    paths = params.get("paths", ["."])
+    root = Path(params.get("root", str(PROJECT_ROOT)))
+    include_ext = set(params.get("extensions", [".py", ".yaml", ".yml", ".surql", ".toml", ".sh"]))
+    exclude_dirs = set(params.get("exclude", ["__pycache__", ".venv", ".git", "node_modules", "data"]))
+
+    lines = []
+    file_index = []
+
+    # Collect all matching files
+    all_files = []
+    for p in paths:
+        scan = root / p
+        if scan.is_file():
+            all_files.append(scan)
+        elif scan.is_dir():
+            for f in sorted(scan.rglob("*")):
+                if f.is_file() and f.suffix in include_ext:
+                    if not any(ex in f.parts for ex in exclude_dirs):
+                        all_files.append(f)
+
+    for filepath in all_files:
+        rel = filepath.relative_to(root)
+        total_lines = len(filepath.read_text(encoding="utf-8", errors="replace").splitlines())
+        file_entry = {"path": str(rel), "lines": total_lines, "type": filepath.suffix}
+
+        if filepath.suffix == ".py":
+            skel = _skeleton_python(filepath)
+            lines.append(f"{rel} ({total_lines} lines)")
+            for s in skel:
+                lines.append(s)
+            lines.append("")
+            file_entry["symbols"] = len(skel)
+
+        elif filepath.suffix in (".yaml", ".yml"):
+            try:
+                data = _yaml.safe_load(filepath.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and "steps" in data:
+                    steps = data["steps"]
+                    step_list = ", ".join(s["id"] + ":" + s["action"] for s in steps)
+                    desc = data.get("description", "").strip()[:80]
+                    lines.append(f"{rel} -- {data.get('flow', rel.stem)} ({len(steps)} steps: {step_list})")
+                    if desc:
+                        lines.append(f"  {desc}")
+                    file_entry["flow_name"] = data.get("flow", "")
+                    file_entry["step_count"] = len(steps)
+                else:
+                    lines.append(f"{rel} ({total_lines} lines, config)")
+            except Exception:
+                lines.append(f"{rel} ({total_lines} lines)")
+            lines.append("")
+
+        elif filepath.suffix == ".surql":
+            tables = _extract_surql_tables(filepath)
+            lines.append(f"{rel} -- tables: {', '.join(tables) if tables else 'none'}")
+            lines.append("")
+            file_entry["tables"] = tables
+
+        elif filepath.suffix == ".toml":
+            skel = _skeleton_toml(filepath)
+            lines.append(f"{rel} ({total_lines} lines)")
+            for s in skel:
+                lines.append(s)
+            lines.append("")
+
+        else:
+            lines.append(f"{rel} ({total_lines} lines)")
+            lines.append("")
+
+        file_index.append(file_entry)
+
+    text = "\n".join(lines)
+    token_est = len(text) // 4  # rough estimate
+
+    log.info(f"  manifest.build: {len(file_index)} files, ~{token_est} tokens")
+
+    return {
+        "text": text,
+        "files": file_index,
+        "file_count": len(file_index),
+        "token_estimate": token_est,
+    }
+
+
+def _skeleton_python(filepath: Path) -> list[str]:
+    """Extract structural skeleton from a Python file via AST."""
+    try:
+        source = filepath.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(source)
+    except SyntaxError:
+        return ["  (syntax error, cannot parse)"]
+
+    lines = []
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, ast.ClassDef):
+            bases = ", ".join(
+                a.id if isinstance(a, ast.Name) else str(a) for a in node.bases
+            )
+            base_str = f"({bases})" if bases else ""
+            lines.append(f"  L{node.lineno:4d}  class {node.name}{base_str}")
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.FunctionDef):
+                    args = ", ".join(a.arg for a in child.args.args)
+                    lines.append(f"  L{child.lineno:4d}    def {child.name}({args})")
+
+        elif isinstance(node, ast.FunctionDef):
+            args = ", ".join(a.arg for a in node.args.args)
+            deco = ""
+            for d in node.decorator_list:
+                if isinstance(d, ast.Call) and isinstance(d.func, ast.Name):
+                    if d.args and isinstance(d.args[0], ast.Constant):
+                        deco = f'@{d.func.id}("{d.args[0].value}") '
+                elif isinstance(d, ast.Name):
+                    deco = f"@{d.id} "
+            doc = ""
+            if (node.body and isinstance(node.body[0], ast.Expr)
+                    and isinstance(node.body[0].value, ast.Constant)):
+                doc = node.body[0].value.value.split("\n")[0].strip()
+                doc = f"  -- {doc}"
+            lines.append(f"  L{node.lineno:4d}  {deco}def {node.name}({args}){doc}")
+
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id.isupper():
+                    lines.append(f"  L{node.lineno:4d}  {target.id} = ...")
+
+    return lines
+
+
+def _extract_surql_tables(filepath: Path) -> list[str]:
+    """Extract DEFINE TABLE names from SurrealQL."""
+    text = filepath.read_text(encoding="utf-8", errors="replace")
+    tables = []
+    for line in text.splitlines():
+        m = _re.match(r"DEFINE TABLE\s+(\w+)", line)
+        if m:
+            tables.append(m.group(1))
+    return tables
+
+
+def _skeleton_toml(filepath: Path) -> list[str]:
+    """Extract section headers and key fields from TOML."""
+    lines = []
+    for raw_line in filepath.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = raw_line.strip()
+        if stripped.startswith("["):
+            lines.append(f"  {stripped}")
+        elif "=" in stripped and not stripped.startswith("#"):
+            key = stripped.split("=")[0].strip()
+            val = stripped.split("=", 1)[1].strip()[:60]
+            lines.append(f"    {key} = {val}")
+    return lines
+
+
+# ── File Operations ───────────────────────────────────────────────
+
+@register_action("file.read")
+def action_file_read(params: dict, ctx: RunContext) -> dict:
+    """Read one or more files and return their contents.
+
+    Params:
+        paths: list of file paths (relative to project root)
+        line_range: optional {start, end} to read a slice
+    """
+    paths = params.get("paths", [])
+    root = Path(params.get("root", str(PROJECT_ROOT)))
+    line_range = params.get("line_range")
+
+    if isinstance(paths, str):
+        paths = [paths]
+
+    results = {}
+    total_chars = 0
+
+    for p in paths:
+        filepath = root / p
+        if not filepath.exists():
+            results[p] = {"error": f"not found: {filepath}"}
+            continue
+
+        text = filepath.read_text(encoding="utf-8", errors="replace")
+
+        if line_range:
+            file_lines = text.splitlines()
+            start = line_range.get("start", 1) - 1
+            end = line_range.get("end", len(file_lines))
+            text = "\n".join(file_lines[start:end])
+
+        results[p] = {
+            "content": text,
+            "lines": len(text.splitlines()),
+            "chars": len(text),
+        }
+        total_chars += len(text)
+
+    log.info(f"  file.read: {len(paths)} files, {total_chars} chars")
+
+    return {
+        "files": results,
+        "file_count": len(results),
+        "total_chars": total_chars,
+        "token_estimate": total_chars // 4,
+    }
+
+
+@register_action("file.write")
+def action_file_write(params: dict, ctx: RunContext) -> dict:
+    """Write content to a file.
+
+    Params:
+        path: file path (relative to project root)
+        content: string to write
+        mode: "overwrite" (default) or "append"
+    """
+    path = params.get("path", "")
+    content = params.get("content", "")
+    mode = params.get("mode", "overwrite")
+    root = Path(params.get("root", str(PROJECT_ROOT)))
+
+    if not path:
+        return {"error": "no path specified"}
+
+    if ctx.dry_run:
+        return {"path": path, "status": "dry_run", "chars": len(content)}
+
+    filepath = root / path
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+
+    if mode == "append":
+        with open(filepath, "a", encoding="utf-8") as f:
+            f.write(content)
+    else:
+        filepath.write_text(content, encoding="utf-8")
+
+    log.info(f"  file.write: {path} ({len(content)} chars, mode={mode})")
+
+    return {
+        "path": path,
+        "status": "written",
+        "chars": len(content),
+        "lines": len(content.splitlines()),
+    }
+
+
+# ── Context Selection ─────────────────────────────────────────────
+
+@register_action("context.select")
+def action_context_select(params: dict, ctx: RunContext) -> dict:
+    """Given a manifest and an LLM's file selection, read only the relevant files.
+
+    This is the glue between manifest.build → LLM planning → file.read.
+    Accepts either a structured list or raw LLM text and extracts file paths.
+
+    Params:
+        manifest: output from manifest.build
+        selection: list of file paths OR dict with "read"/"modify" keys
+                   OR raw text containing file paths
+    """
+    manifest = params.get("manifest", {})
+    selection = params.get("selection", [])
+    root = Path(params.get("root", str(PROJECT_ROOT)))
+
+    # Known file paths from manifest
+    known_paths = {f["path"] for f in manifest.get("files", [])}
+
+    # Extract paths from selection (flexible input)
+    selected = set()
+
+    if isinstance(selection, list):
+        selected = set(selection)
+    elif isinstance(selection, dict):
+        for key in ("read", "modify", "files"):
+            val = selection.get(key, [])
+            if isinstance(val, list):
+                selected.update(val)
+            elif isinstance(val, dict):
+                selected.update(val.keys())
+    elif isinstance(selection, str):
+        # Extract paths from raw text — look for anything matching known paths
+        for kp in known_paths:
+            if kp in selection:
+                selected.add(kp)
+
+    # Validate against manifest
+    valid = selected & known_paths
+    invalid = selected - known_paths
+
+    if invalid:
+        log.warning(f"  context.select: unknown paths ignored: {invalid}")
+
+    # Read the selected files
+    if valid:
+        file_contents = action_file_read({"paths": list(valid), "root": str(root)}, ctx)
+    else:
+        file_contents = {"files": {}, "file_count": 0, "total_chars": 0, "token_estimate": 0}
+
+    log.info(f"  context.select: {len(valid)} files selected, "
+             f"~{file_contents.get('token_estimate', 0)} tokens")
+
+    return {
+        "selected_paths": sorted(valid),
+        "invalid_paths": sorted(invalid),
+        "files": file_contents.get("files", {}),
+        "file_count": len(valid),
+        "token_estimate": file_contents.get("token_estimate", 0),
+    }
