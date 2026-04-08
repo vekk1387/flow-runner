@@ -14,6 +14,8 @@ pub struct FlowBuilderApp {
     file_path: Option<PathBuf>,
     /// Temporary buffer for adding a new param key to a step.
     new_param_key: String,
+    /// YAML preview content (Some = overlay visible).
+    yaml_preview: Option<String>,
 }
 
 impl Default for FlowBuilderApp {
@@ -24,6 +26,7 @@ impl Default for FlowBuilderApp {
             status: "Ready — add steps from the action palette".into(),
             file_path: None,
             new_param_key: String::new(),
+            yaml_preview: None,
         }
     }
 }
@@ -312,7 +315,7 @@ impl FlowBuilderApp {
             }
             if ui.button("\u{1F4CB} Preview YAML").clicked() {
                 match self.flow.to_yaml() {
-                    Ok(yaml) => self.status = format!("--- YAML Preview ---\n{yaml}"),
+                    Ok(yaml) => self.yaml_preview = Some(yaml),
                     Err(e) => self.status = format!("YAML error: {e}"),
                 }
             }
@@ -343,13 +346,32 @@ impl eframe::App for FlowBuilderApp {
         egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
             self.bottom_bar(ui);
             ui.separator();
-            ui.add(
-                egui::TextEdit::multiline(&mut self.status.as_str())
-                    .desired_rows(2)
-                    .desired_width(f32::INFINITY)
-                    .font(egui::TextStyle::Monospace),
-            );
+            ui.label(&self.status);
         });
+
+        // YAML preview overlay
+        if self.yaml_preview.is_some() {
+            egui::Window::new("YAML Preview")
+                .collapsible(false)
+                .resizable(true)
+                .default_size([500.0, 400.0])
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    if ui.button("Close").clicked() {
+                        self.yaml_preview = None;
+                        return;
+                    }
+                    ui.separator();
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        let yaml = self.yaml_preview.as_deref().unwrap_or("");
+                        ui.add(
+                            egui::TextEdit::multiline(&mut yaml.to_string())
+                                .desired_width(f32::INFINITY)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                    });
+                });
+        }
 
         // Left panel: action palette
         egui::SidePanel::left("actions")
